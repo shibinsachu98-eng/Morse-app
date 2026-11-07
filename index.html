@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CW Station</title>
+<!--
+HOW TO RUN: save as index.html, open in Chrome/Edge/Firefox/Safari (double-click or any static server).
+Microphone listening needs https:// or localhost on some browsers; "TX loopback" source works anywhere (test the decoder with no radio).
+ASSUMPTIONS: Farnsworth = element timing at WPM, char/word gaps stretched to Farnsworth WPM. Prosign collisions (AR=+, BT==, KN=( ) decode as those glyphs; SK decodes as <SK>.
+KNOWN LIMITS: CW Duel/Invaders/Battleship games, leaderboard and real ML inference are NOT included (ML toggle loads TF.js and looks for ./cwnet/model.json, otherwise falls back to classical).
+LM is unigram + ham-phrase list (no bigrams). ScriptProcessorNode is deprecated but universally supported.
+-->
+<style>
+:root{--bg:#0a1424;--pn:#12233f;--ink:#d8e6ff;--ac:#4aa3ff;--dim:#6d84a8}
+[data-theme=green]{--bg:#07140c;--pn:#0f2418;--ink:#d4ffe0;--ac:#3dff7a;--dim:#5f8f6e}
+[data-theme=purple]{--bg:#150c24;--pn:#241540;--ink:#eadcff;--ac:#b66bff;--dim:#8a74ab}
+[data-theme=gameboy]{--bg:#8bac0f;--pn:#9bbc0f;--ink:#0f380f;--ac:#306230;--dim:#306230}
+[data-theme=crt]{--bg:#0b0700;--pn:#171000;--ink:#ffb000;--ac:#ffcc33;--dim:#a06e00}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-monospace,Menlo,Consolas,monospace}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--dim)}
+h1{font-size:19px;margin:0 auto 0 0;letter-spacing:.5px}h2{margin:0 0 6px;font-size:16px}h3{margin:14px 0 4px;font-size:14px}
+main{max-width:980px;margin:auto;padding:12px}
+section{display:none;background:var(--pn);border:1px solid var(--dim);padding:12px}
+section.on{display:block}
+button,select,input,textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--dim);padding:5px 9px;border-radius:3px}
+button{cursor:pointer}button:hover,button:focus-visible{border-color:var(--ac);outline:none}
+button.on{background:var(--ac);color:var(--bg);font-weight:700}
+textarea{width:100%;min-height:72px}input[type=range]{padding:0}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}label{display:flex;gap:6px;align-items:center}
+canvas{width:100%;background:#000;border:1px solid var(--dim);display:block}
+#dot{width:110px;height:110px;border-radius:50%;background:var(--ac);opacity:.12;margin:12px auto;transition:opacity 40ms}
+#dot.lit{opacity:1;box-shadow:0 0 44px var(--ac)}
+pre{white-space:pre-wrap;word-break:break-all;margin:6px 0;color:var(--ac)}
+b{color:var(--ac)}#pad{padding:16px 28px}.sg{border:1px dashed var(--ac);padding:8px;margin:8px 0}
+body.audioonly .vis{visibility:hidden}body.audioonly.peek .vis{visibility:visible}
+@media(max-width:600px){h1{width:100%}}
+@media(prefers-reduced-motion:reduce){#dot{transition:none}}
+</style></head><body>
+<header><h1>CW Station</h1><nav class="row" id="nav" style="margin:0"></nav>
+<label>Theme <select id="theme"><option value="">Blue</option><option>green</option><option>purple</option><option>gameboy</option><option value="crt">Phosphor CRT</option></select></label>
+<label><input type="checkbox" id="ao">Audio-only (hold W to peek)</label></header>
+<main>
+<section id="tx" data-t="Send" class="on"><h2>Sending</h2>
+<textarea id="txt" aria-label="Message to send">CQ CQ DE N0CALL K</textarea>
+<div class="row"><button id="send">Send</button><button id="clr">Clear</button><button id="play">Play</button><button id="pause">Pause</button><button id="stop">Stop</button><button id="qso">Random QSO</button><button id="wavb">Export WAV</button></div>
+<div class="row"><label>WPM <input type="range" id="wpm" min="5" max="30" value="15"><b id="wpmv">15</b></label>
+<label>Tone <input type="range" id="hz" min="300" max="1500" value="700"><b id="hzv">700</b> Hz</label>
+<label>Farnsworth <input type="range" id="fw" min="5" max="30" value="15"><b id="fwv">15</b></label>
+<label>Wave <select id="wave"><option>sine</option><option>triangle</option><option>square</option><option>sawtooth</option></select></label></div>
+<div id="dot" class="vis"></div><pre id="morse">Morse appears here (use &lt;AR&gt; &lt;SK&gt; &lt;BT&gt; &lt;KN&gt; for prosigns)</pre>
+<canvas id="scope" class="vis" width="600" height="120"></canvas>
+<h3>Noise simulation</h3><div class="row" id="nz"></div>
+<h3>Straight-key practice</h3>
+<div class="row"><label><input type="checkbox" id="km">Key mode (Space bar)</label><button id="pad">Hold to key</button><span>Send: <b id="kt">–</b></span><span id="kf"></span></div>
+</section>
+
+<section id="rx" data-t="Receive"><h2>Receiving</h2>
+<div class="row"><button id="rxb">Listen</button><label>Source <select id="src"><option value="mic">Microphone</option><option value="loop">TX loopback</option></select></label>
+<label>Algorithm <select id="algo"><option value="otsu">Otsu</option><option value="bayes">Bayesian</option><option value="ml">ML (optional)</option></select></label>
+<label><input type="checkbox" id="lm">LM post-processor</label><label><input type="checkbox" id="afc" checked>AFC</label>
+<label>Manual Hz <input type="number" id="mh" min="300" max="1500" value="700" style="width:80px"></label><button id="rxc">Clear</button></div>
+<div class="row">WPM <b id="rxw">–</b> Tone <b id="rxh">–</b> Hz SNR <b id="rxs">–</b> dB Lock <b id="rxl">–</b> <span id="rxnote"></span></div>
+<canvas id="rxcv" width="600" height="300"></canvas>
+<textarea id="rxout" readonly aria-label="Decoded text"></textarea>
+<h3>Session history</h3><div id="hist"></div></section>
+
+<section id="ls" data-t="Listener"><h2>Live listener</h2>
+<div class="row"><button id="lsb">Start listening</button><label>Source <select id="src2"><option value="mic">Microphone</option><option value="loop">TX loopback</option></select></label>
+<label>Sensitivity <input type="range" id="sens" min="0" max="1" step=".05" value=".5"></label><label>My call <input id="mycall" value="N0CALL" style="width:90px"></label>
+WPM <b id="lsw">–</b> Hz <b id="lsh">–</b> SNR <b id="lss">–</b> <b id="lsl">–</b> <span id="lsnote"></span></div>
+<canvas id="lscv" width="600" height="300"></canvas>
+<textarea id="lsout" readonly aria-label="Transcript"></textarea>
+<div class="sg">Suggested reply: <b id="sugg">–</b></div></section>
+
+<section id="ln" data-t="Learn"><h2>Koch course &amp; lessons</h2>
+<div id="dash"></div>
+<div class="row"><button id="l1">Koch drill</button><button id="l2">Drill weak characters</button></div>
+<textarea id="cust" placeholder="Paste any text for a custom listening lesson"></textarea><div class="row"><button id="l3">Play custom lesson</button></div>
+<div class="row"><input id="ans" placeholder="Type what you heard" style="flex:1"><button id="chk">Check</button></div><div id="lr"></div></section>
+
+<section id="hb" data-t="Translate"><h2>Text ⇄ Morse</h2>
+<textarea id="hub" placeholder="Type text, or Morse (dots, dashes, spaces, / between words)"></textarea><pre id="hubo"></pre><div id="hubc"></div></section>
+</main>
+<script>
+'use strict';
+const $=s=>document.querySelector(s),clamp=(v,a,b)=>Math.min(b,Math.max(a,v)),avg=a=>a.reduce((x,y)=>x+y,0)/a.length;
+const TABLE={A:'.-',B:'-...',C:'-.-.',D:'-..',E:'.',F:'..-.',G:'--.',H:'....',I:'..',J:'.---',K:'-.-',L:'.-..',M:'--',N:'-.',O:'---',P:'.--.',Q:'--.-',R:'.-.',S:'...',T:'-',U:'..-',V:'...-',W:'.--',X:'-..-',Y:'-.--',Z:'--..',0:'-----',1:'.----',2:'..---',3:'...--',4:'....-',5:'.....',6:'-....',7:'--...',8:'---..',9:'----.','.':'.-.-.-',',':'--..--','?':'..--..','/':'-..-.',"'":'.----.','!':'-.-.--','(':'-.--.',')':'-.--.-','&':'.-...',':':'---...',';':'-.-.-.','=':'-...-','+':'.-.-.','-':'-....-',_:'..--.-','"':'.-..-.',$:'...-..-','@':'.--.-.'};
+const PROS={AR:'.-.-.',SK:'...-.-',BT:'-...-',KN:'-.--.'};
+const REV={};for(const k in TABLE)REV[TABLE[k]]=k;REV['...-.-']='<SK>';
+// Binary decode tree: '.' = left, '-' = right; node.c holds the character.
+const TREE={};for(const c in REV){let n=TREE;for(const s of c)n=n[s]=n[s]||{};n.c=REV[c];}
+
+/* ---------- MorseEncoder: text <-> Morse, chars split by ' ', words by ' / ' ---------- */
+class MorseEncoder{
+ static encode(t){return t.toUpperCase().split(/\s+/).filter(Boolean).map(w=>(w.match(/<(?:AR|SK|BT|KN)>|[^]/g)||[]).map(c=>c.length>1?PROS[c.slice(1,-1)]:TABLE[c]).filter(Boolean).join(' ')).filter(Boolean).join(' / ');}
+ static decode(m){return m.trim().split(/\s*\/\s*/).map(w=>w.split(/\s+/).filter(Boolean).map(c=>REV[c]||'?').join('')).join(' ');}
+}
+
+/* ---------- NoiseSimulator: procedural QRN/QSB/QRM/flutter/chirp. build() works on any (Offline)AudioContext ---------- */
+class NoiseSimulator{
+ constructor(){this.lv={qrn:0,qsb:0,qrm:0,flutter:0,chirp:0};this.n=null;}
+ build(ctx,dest){
+  const L=this.lv,sr=ctx.sampleRate,inp=ctx.createGain(),qsb=ctx.createGain(),fl=ctx.createGain();
+  inp.connect(qsb);qsb.connect(fl);fl.connect(dest);
+  const lfo=(f,g)=>{const o=ctx.createOscillator(),d=ctx.createGain();o.frequency.value=f;o.connect(d);d.connect(g.gain);o.start();return d};
+  const dq=lfo(.2,qsb);                       // QSB: slow fade, depth scales gain between 1 and 1-qsb
+  const df=lfo(23,fl);                        // flutter: fast shallow AM
+  // QRN: looped white noise with random crackle impulses
+  const nb=ctx.createBuffer(1,sr*2,sr),d=nb.getChannelData(0);
+  for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*(Math.random()<.003?5:1);
+  const ns=ctx.createBufferSource();ns.buffer=nb;ns.loop=true;const ng=ctx.createGain();ns.connect(ng);ng.connect(dest);ns.start();
+  // QRM: neighbour station keying random dits/dahs on an offset tone
+  const q=ctx.createOscillator(),qk=ctx.createGain(),qm=ctx.createGain();q.frequency.value=840;q.connect(qk);qk.connect(qm);qm.connect(dest);q.start();
+  qk.gain.value=0;for(let t=0;t<90;){const on=.06*(Math.random()<.5?1:3);qk.gain.setValueAtTime(1,t);qk.gain.setValueAtTime(0,t+on);t+=on+.06*(Math.random()<.8?1:4)}
+  this.n={qsb,fl,dq,df,ng,qm};this.apply();return inp;}
+ apply(){if(!this.n)return;const L=this.lv,n=this.n;n.qsb.gain.value=1-L.qsb/2;n.dq.gain.value=L.qsb/2;n.fl.gain.value=1-L.flutter*.2;n.df.gain.value=L.flutter*.2;n.ng.gain.value=L.qrn*.45;n.qm.gain.value=L.qrm*.35;}
+ set(k,v){this.lv[k]=v;this.apply();}
+}
+
+/* ---------- MorsePlayer: look-ahead scheduler on AudioContext.currentTime; params read live => mid-message sweeps ---------- */
+class MorsePlayer{
+ constructor(){this.p={wpm:15,fw:15,hz:700,type:'sine'};this.q=[];this.lit=false;this.state='idle';this.noise=new NoiseSimulator();}
+ ensure(){
+  if(!this.ctx){const C=window.AudioContext||window.webkitAudioContext;if(!C)throw Error('Web Audio unsupported');
+   this.ctx=new C();this.master=this.ctx.createGain();this.an=this.ctx.createAnalyser();this.an.fftSize=2048;
+   this.sig=this.noise.build(this.ctx,this.master);this.master.connect(this.an);this.master.connect(this.ctx.destination);}
+  if(this.ctx.state==='suspended'&&this.state!=='paused')this.ctx.resume();return this.ctx;}
+ // Sequence of [on?, units, farnsworthStretched?]. dot=1, dash=3, intra=1, char=3, word=7 units.
+ seq(m){const s=[];m.split(' / ').forEach((w,wi)=>{if(wi)s.push([0,7,1]);w.split(' ').filter(Boolean).forEach((c,ci)=>{if(ci)s.push([0,3,1]);[...c].forEach((e,ei)=>{if(ei)s.push([0,1,0]);s.push([1,e==='.'?1:3,0])})})});return s;}
+ unit(fs){const p=this.p;return 1.2/(fs?Math.min(p.fw,p.wpm):p.wpm);}   // dotSec = 1.2 / wpm
+ // 5 ms attack/release ramps avoid key clicks; chirp = small upward pitch glitch at key-down.
+ static env(osc,g,t,d,hz,ch){const f=osc.frequency,a=g.gain;f.setValueAtTime(hz*(1+ch*.03),t);if(ch)f.exponentialRampToValueAtTime(hz,t+.03);
+  a.setValueAtTime(0,t);a.linearRampToValueAtTime(1,t+.005);a.setValueAtTime(1,t+d-.005);a.linearRampToValueAtTime(0,t+d);}
+ play(m,onend){
+  this.stop();const c=this.ensure();this.s=this.seq(m);this.i=0;this.t=c.currentTime+.08;this.onend=onend;
+  const o=this.osc=c.createOscillator(),g=this.g=c.createGain();o.type=this.p.type;g.gain.value=0;o.connect(g);g.connect(this.sig);o.start();
+  this.state='play';this.tm=setInterval(()=>this.pump(),25);this.pump();}
+ pump(){
+  const c=this.ctx,p=this.p;this.osc.type=p.type;
+  while(this.i<this.s.length&&this.t<c.currentTime+.25){const[on,u,fs]=this.s[this.i++],d=u*this.unit(fs);
+   if(on){MorsePlayer.env(this.osc,this.g,this.t,d,p.hz,this.noise.lv.chirp);this.q.push([this.t,1],[this.t+d,0]);}this.t+=d;}
+  if(this.i>=this.s.length&&c.currentTime>this.t+.15){const f=this.onend;this.stop();if(f)f();}}
+ sync(){while(this.q.length&&this.q[0][0]<=this.ctx.currentTime)this.lit=!!this.q.shift()[1];}
+ pause(){if(!this.ctx)return;if(this.state==='play'){this.state='paused';this.ctx.suspend();}else if(this.state==='paused'){this.state='play';this.ctx.resume();}}
+ stop(){clearInterval(this.tm);if(this.osc){try{this.g.gain.cancelScheduledValues(0);this.g.gain.setValueAtTime(0,this.ctx.currentTime);this.osc.stop(this.ctx.currentTime+.02)}catch(e){}this.osc=null;}
+  if(this.ctx&&this.state==='paused')this.ctx.resume();this.q=[];this.lit=false;this.state='idle';}
+ async render(m){ // WAV export through OfflineAudioContext (current params + noise mix)
+  const s=this.seq(m),p=this.p,sr=22050;let T=.4;s.forEach(([o,u,f])=>T+=u*this.unit(f));
+  const oc=new OfflineAudioContext(1,Math.ceil(T*sr),sr),mst=oc.createGain();mst.connect(oc.destination);
+  const inp=this.noise.build(oc,mst),o=oc.createOscillator(),g=oc.createGain();o.type=p.type;g.gain.value=0;o.connect(g);g.connect(inp);o.start();
+  let t=.1;s.forEach(([on,u,f])=>{const d=u*this.unit(f);if(on)MorsePlayer.env(o,g,t,d,p.hz,this.noise.lv.chirp);t+=d});
+  const b=await oc.startRendering(),d=b.getChannelData(0),n=d.length,v=new DataView(new ArrayBuffer(44+n*2)),w=(a,x)=>[...x].forEach((c,i)=>v.setUint8(a+i,c.charCodeAt(0)));
+  w(0,'RIFF');v.setUint32(4,36+n*2,true);w(8,'WAVEfmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++)v.setInt16(44+i*2,clamp(d[i],-1,1)*32767,true);return new Blob([v],{type:'audio/wav'});}
+}
+
+/* ---------- Language model post-processor (local; unigram rank + ham phrases) ---------- */
+const LM={
+ W:('THE OF AND TO IN IS IT YOU THAT HE WAS FOR ON ARE WITH AS HIS THEY BE AT ONE HAVE THIS FROM OR HAD BY BUT WHAT SOME WE CAN OUT OTHER WERE ALL THERE WHEN UP USE YOUR HOW SAID AN EACH SHE WHICH DO THEIR TIME IF WILL WAY ABOUT MANY THEN THEM WOULD LIKE SO THESE HER LONG MAKE SEE HIM TWO HAS LOOK MORE DAY COULD GO COME DID NO MOST PEOPLE MY OVER KNOW WATER THAN CALL FIRST WHO MAY DOWN BEEN NOW FIND NAME WORK HERE GOOD MORNING EVENING SIGNAL STRONG WEAK BAND RADIO CALLING '+
+ 'CQ DE K KN SK AR BT 73 88 RST QTH UR HR HW COPY TNX TKS FB OM ES GM GA GE GN PSE AGN WX RIG ANT PWR CW QRZ QSL QRM QRN QSB QRP QRV TEST').split(' '),
+ fix(text){
+  const W=this.W;return text.split(' ').map(t=>{
+   if(!t||W.includes(t)||/^[A-Z0-9]{1,2}[0-9][A-Z]{1,3}(\/\w+)?$/.test(t)||/^\d+$/.test(t))return t;
+   if(t.length>2){const w=W.find(w=>w.length===t.length&&[...w].filter((c,i)=>c!==t[i]).length===1);if(w)return w;}
+   // re-segment run-on text: DP preferring fewest, most common words
+   const best=[0];const prev=[];for(let i=1;i<=t.length;i++){best[i]=1e9;for(let j=0;j<i;j++){const s=t.slice(j,i),r=W.indexOf(s);if(r>=0&&(s.length>1||'IK'.includes(s))&&best[j]+1+r/200<best[i]){best[i]=best[j]+1+r/200;prev[i]=j;}}}
+   if(best[t.length]<1e9){const o=[];for(let i=t.length;i>0;i=prev[i])o.unshift(t.slice(prev[i],i));return o.join(' ');}
+   return t;}).join(' ');}
+};
+
+/* ---------- MorseDecoder: AFC + Goertzel envelope + threshold (Otsu/Bayes) + adaptive timing + tree decode ---------- */
+class MorseDecoder{
+ constructor(o){this.o=o;this.algo='otsu';this.lm=false;this.afc=true;this.sens=.5;this.hz=700;this.running=false;}
+ async start(src){
+  const o=this.o;
+  try{
+   if(src==='loop'){this.ctx=o.player.ensure();this.node=o.player.master;this.own=false;}
+   else{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw Error('Microphone API unsupported in this browser');
+    // Disable browser DSP: AGC/noise suppression would destroy keying edges.
+    this.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    const C=window.AudioContext||window.webkitAudioContext;this.ctx=new C();this.node=this.ctx.createMediaStreamSource(this.stream);this.own=true;}
+   if(!this.ctx.createScriptProcessor)throw Error('ScriptProcessorNode unsupported');
+   await this.ctx.resume();
+  }catch(e){o.note('Cannot listen: '+(e.name==='NotAllowedError'?'microphone permission denied':e.message));return false;}
+  const c=this.ctx;this.sr=c.sampleRate;this.B=256;this.dt=this.B/this.sr*1000;   // ~5 ms Goertzel blocks
+  this.win=Float32Array.from({length:this.B},(_,i)=>.54-.46*Math.cos(2*Math.PI*i/(this.B-1)));
+  this.an=c.createAnalyser();this.an.fftSize=4096;this.an.smoothingTimeConstant=.4;
+  this.sp=c.createScriptProcessor(1024,1,1);this.node.connect(this.an);this.node.connect(this.sp);this.sp.connect(c.destination);
+  this.wf=document.createElement('canvas');this.wf.width=o.cv.width;this.wf.height=140;this.row=this.wf.getContext('2d').createImageData(this.wf.width,1);
+  Object.assign(this,{dit:80,nf:1e-4,pk:3e-4,m0:1e-4,s0:1e-4,m1:1e-3,s1:3e-4,p1:.4,th:0,on:false,run:0,prev:0,has:false,sym:'',raw:'',env:[],pl:[],hist:[],lock:false,locked:false,word:false,snr:0,n:0,t0:Date.now(),q:0});
+  this.ac=getComputedStyle(document.body).getPropertyValue('--ac').trim()||'#4af';
+  this.sp.onaudioprocess=e=>{const x=e.inputBuffer.getChannelData(0),w=2*Math.PI*this.hz/this.sr;for(let s=0;s+this.B<=x.length;s+=this.B)this.step(this.gz(x,s,w));};
+  this.running=true;this.afcT=setInterval(()=>this.afcTick(),1000);o.note('');this.loop();return true;}
+ stop(){this.running=false;clearInterval(this.afcT);cancelAnimationFrame(this.raf);
+  try{this.sp.onaudioprocess=null;this.sp.disconnect();this.node.disconnect(this.an);this.node.disconnect(this.sp);}catch(e){}
+  if(this.stream)this.stream.getTracks().forEach(t=>t.stop());if(this.own&&this.ctx)this.ctx.close();this.stream=null;}
+ // Goertzel: single-bin DFT magnitude (Hamming windowed) at the locked tone.
+ gz(x,s,w){const co=2*Math.cos(w);let a=0,b=0;for(let i=0;i<this.B;i++){const n=x[s+i]*this.win[i]+co*a-b;b=a;a=n;}return Math.sqrt(Math.max(0,a*a+b*b-co*a*b))/this.B;}
+ // AFC: strongest FFT bin in 300-1500 Hz (parabolic interpolation), median of last 5 detections.
+ afcTick(){
+  const a=this.an,f=this.fb||(this.fb=new Float32Array(a.frequencyBinCount));a.getFloatFrequencyData(f);
+  const bw=this.sr/a.fftSize,lo=Math.floor(300/bw),hi=Math.ceil(1500/bw);let k=lo,sum=0;
+  for(let i=lo;i<=hi;i++){f[i]=Math.max(f[i],-140);sum+=f[i];if(f[i]>f[k])k=i;}
+  if(f[k]-sum/(hi-lo+1)>14){const y0=f[k-1],y1=f[k],y2=f[k+1],d=y0-2*y1+y2,p=d?.5*(y0-y2)/d:0;
+   this.hist.push((k+clamp(p,-1,1))*bw);if(this.hist.length>5)this.hist.shift();
+   if(this.afc)this.hz=[...this.hist].sort((x,y)=>x-y)[this.hist.length>>1];this.locked=true;}else this.locked=false;}
+ // Otsu: threshold maximizing between-class variance over the last ~2 s of envelope values.
+ otsu(){const e=this.env,mn=Math.min(...e),mx=Math.max(...e);if(mx<=mn*1.0001)return mx;const K=32,h=new Array(K).fill(0);
+  e.forEach(v=>h[Math.min(K-1,((v-mn)/(mx-mn)*K)|0)]++);let sum=0;h.forEach((c,i)=>sum+=i*c);let wB=0,sB=0,best=0,bt=0;
+  for(let i=0;i<K;i++){wB+=h[i];const wF=e.length-wB;if(!wB)continue;if(!wF)break;sB+=i*h[i];const v=wB*wF*(sB/wB-(sum-sB)/wF)**2;if(v>best){best=v;bt=i}}return mn+(bt+1)/K*(mx-mn);}
+ step(m){
+  this.env.push(m);if(this.env.length>400)this.env.shift();
+  if(m<this.nf)this.nf+=(m-this.nf)*.2;else if(!this.on)this.nf+=(m-this.nf)*.01;       // noise floor EMA (rises only while key up)
+  if(m>this.pk)this.pk+=(m-this.pk)*.5;else this.pk-=(this.pk-this.nf)*.0005;
+  this.snr+=(20*Math.log10(this.pk/this.nf)-this.snr)*.01;let on;
+  if(this.algo==='bayes'){ // two-Gaussian hard-EM with sticky prior (hysteresis in log-likelihood domain): copes with weak/noisy keying
+   const g=(v,mu,s)=>-Math.log(s)-.5*((v-mu)/s)**2,s0=Math.max(this.s0,.02*this.pk),s1=Math.max(this.s1,.1*this.pk);
+   const llr=g(m,this.m1,s1)-g(m,this.m0,s0)+Math.log(this.p1/(1-this.p1))+(this.on?1.5:-1.5);
+   on=llr>0&&this.pk>this.nf*(1.2+2*(1-this.sens));
+   if(on){this.m1+=(m-this.m1)*.02;this.s1+=(Math.abs(m-this.m1)-this.s1)*.02;this.p1+=(1-this.p1)*.002}
+   else{this.m0+=(m-this.m0)*.02;this.s0+=(Math.abs(m-this.m0)-this.s0)*.02;this.p1-=this.p1*.002}
+   this.p1=clamp(this.p1,.05,.95);this.thr=(this.m0+this.m1)/2;
+  }else{ // Otsu threshold + Schmitt trigger (separate ON/OFF levels) + SNR gate set by sensitivity
+   if(this.n%10===0)this.th=this.otsu();
+   const thr=Math.max(this.th,this.nf*(1.3+3*(1-this.sens))),hy=(this.pk-this.nf)*.1;this.thr=thr;on=this.on?m>thr-hy:m>thr+hy;}
+  this.n++;
+  if(on!==this.on){
+   if(this.run<10&&this.has){this.run+=this.prev;this.on=on;this.has=false;}       // debounce: swallow <10 ms glitches
+   else{this.end(this.on,this.run);this.prev=this.run;this.has=true;this.on=on;this.run=0;if(on)this.word=false;}}
+  this.run+=this.dt;if(!this.on)this.live();
+  if(this.n%40===0)this.o.stats({wpm:this.lock?Math.round(1200/this.dit):'–',hz:Math.round(this.hz),snr:this.snr.toFixed(1),lock:this.lock&&this.locked?'LOCKED':this.locked?'TONE':'SEARCH'});}
+ end(on,ms){
+  if(!on)return;const d=this.dit;
+  this.sym+=ms>=2*d?'-':'.';                          // pulse >= 2 dit => dash
+  this.dit=clamp(.75*d+.25*(ms>=2*d?ms/3:ms),20,240); // EMA; 20 ms = 60 WPM, 240 ms = 5 WPM
+  this.pl.push(ms);if(this.pl.length>20)this.pl.shift();
+  if(this.pl.length>=6){const mn=Math.min(...this.pl),mx=Math.max(...this.pl);if(mx>2*mn){ // 2-cluster re-estimate: dit = mean(short)=mean(long)/3
+   const th=Math.sqrt(mn*mx),s=this.pl.filter(v=>v<th),l=this.pl.filter(v=>v>=th);this.dit=clamp(.5*avg(s)+.5*avg(l)/3,20,240);}}
+  this.lock=true;}
+ live(){ // key-up: emit char at gap>=2 dit, word space at >=6 dit, reset after 2 s silence
+  const d=this.dit,g=this.run;
+  if(this.sym&&g>=2*d){let n=TREE;for(const s of this.sym)n=n&&n[s];this.emit(n&&n.c||'?');this.sym='';}
+  if(!this.word&&g>=6*d&&this.raw&&!this.raw.endsWith(' ')){this.emit(' ');this.word=true;}
+  if(g>2000&&this.lock){this.lock=false;this.sym='';this.pl=[];}}   // assumption: keep last dit estimate, re-learn from new pulses
+ emit(c){this.raw+=c;this.view();this.o.char&&this.o.char(c);}
+ view(){this.o.text(this.lm?LM.fix(this.raw):this.raw);}
+ clear(){this.raw='';this.view();}
+ // Optional ML decoder: load TF.js lazily; classical pipeline remains active either way (inference hook not wired).
+ async setAlgo(a){this.algo=a==='ml'?'otsu':a;if(a!=='ml'){this.o.note('');return true;}
+  const ok=await new Promise(r=>{if(window.tf)return r(true);const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js';s.onload=()=>r(true);s.onerror=()=>r(false);document.head.appendChild(s);});
+  if(!ok){this.o.note('ML unavailable (offline?) - using Otsu');return false;}
+  try{await tf.loadLayersModel('cwnet/model.json');this.o.note('ML model found but inference not wired - using Otsu');}catch(e){this.o.note('No ML model (./cwnet/model.json) - using Otsu');}return false;}
+ loop(){
+  if(!this.running)return;const cv=this.o.cv,x=cv.getContext('2d'),W=cv.width,a=this.an,d=this.bd||(this.bd=new Uint8Array(a.frequencyBinCount));a.getByteFrequencyData(d);
+  const bw=this.sr/a.fftSize,b0=Math.floor(200/bw),n=Math.floor(1700/bw)-b0,wx=this.wf.getContext('2d');
+  x.fillStyle='#000';x.fillRect(0,0,W,cv.height);
+  x.strokeStyle=this.ac;x.beginPath();for(let i=0;i<W;i++){const v=d[b0+(i/W*n|0)]/255;i?x.lineTo(i,85-v*80):x.moveTo(i,85-v*80);}x.stroke();   // live FFT spectrum
+  wx.drawImage(this.wf,0,1);const r=this.row.data;for(let i=0;i<W;i++){const v=d[b0+(i/W*n|0)];r[i*4]=Math.min(255,v*2);r[i*4+1]=Math.max(0,v*2-200);r[i*4+2]=255-v*.6;r[i*4+3]=255;}wx.putImageData(this.row,0,0);
+  x.drawImage(this.wf,0,90);                                                                                                         // scrolling waterfall
+  const tx=(this.hz-200)/1500*W;x.strokeStyle='#f55';x.beginPath();x.moveTo(tx,0);x.lineTo(tx,230);x.stroke();
+  const e=this.env,mx=Math.max(this.pk,1e-9)*1.1;x.strokeStyle='#8f8';x.beginPath();e.forEach((v,i)=>{const px=i/400*W,py=295-v/mx*55;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();  // keying envelope
+  x.strokeStyle='#fa0';x.beginPath();x.moveTo(0,295-this.thr/mx*55);x.lineTo(W,295-this.thr/mx*55);x.stroke();
+  this.raf=requestAnimationFrame(()=>this.loop());}
+}
+
+/* ---------- KeyerTrainer: straight-key scoring (dit/dah classification, rhythm, spacing) ---------- */
+class KeyerTrainer{
+ constructor(ui){this.ui=ui;this.reset();}
+ reset(){this.ons=[];this.gaps=[];this.d=0;this.up=0;clearTimeout(this.tm);}
+ next(){const c='ETIANMSURWDKGOHVFLPJBXCYZQ0123456789';this.target=c[Math.random()*c.length|0];this.reset();this.ui.keyShow(this.target,TABLE[this.target]);}
+ u(){return 1200/this.ui.pl.p.wpm;}
+ press(){if(this.d||!this.target)return;const n=performance.now();clearTimeout(this.tm);if(this.up)this.gaps.push(n-this.up);this.d=n;this.ui.sidetone(true);}
+ release(){if(!this.d)return;const n=performance.now();this.ons.push(n-this.d);this.d=0;this.up=n;this.ui.sidetone(false);this.tm=setTimeout(()=>this.score(),this.u()*5);}
+ score(){
+  const u=this.u(),exp=TABLE[this.target],got=this.ons.map(d=>d>=2*u?'-':'.').join('');let ok=0;
+  for(let i=0;i<exp.length;i++)if(got[i]===exp[i])ok++;
+  const acc=100*ok/Math.max(exp.length,got.length);
+  const rh=100*(1-avg(this.ons.map((d,i)=>{const t=(exp[i]==='-'?3:1)*u;return Math.min(1,Math.abs(d-t)/t)})));
+  const sp=this.gaps.length?100*(1-avg(this.gaps.map(g=>Math.min(1,Math.abs(g-u)/u)))):100;
+  this.ui.keyFb(`you sent ${got||'nothing'} (wanted ${exp}) accuracy ${acc.toFixed(0)}% rhythm ${clamp(rh,0,100).toFixed(0)}% spacing ${clamp(sp,0,100).toFixed(0)}%`);
+  this.target='';setTimeout(()=>this.next(),1400);}
+}
+
+/* ---------- LessonEngine: Koch course, adaptive weak-character drills, custom lessons, stats ---------- */
+class LessonEngine{
+ constructor(){this.K='KMRSUAPTLOWI.NJEF0Y,VG5/Q9ZH38B?427C1D6X';let s=null;try{s=JSON.parse(localStorage.getItem('cwlesson'))}catch(e){}this.s=s||{n:2,st:{},streak:0,last:'',acc:[]};}
+ save(){try{localStorage.setItem('cwlesson',JSON.stringify(this.s))}catch(e){}}
+ pool(){return[...this.K.slice(0,this.s.n)];}
+ miss(c){const t=this.s.st[c];return t&&t.a?t.m/t.a:0;}
+ weak(){return this.pool().filter(c=>(this.s.st[c]||{a:0}).a>=3&&this.miss(c)>0).sort((a,b)=>this.miss(b)-this.miss(a)).slice(0,3);}
+ drill(weakOnly){const w=this.weak(),p=weakOnly&&w.length?w:this.pool(),bag=[];p.forEach(c=>{for(let i=0;i<1+Math.round(4*this.miss(c));i++)bag.push(c)});
+  return Array.from({length:6},()=>Array.from({length:5},()=>bag[Math.random()*bag.length|0]).join('')).join(' ');}
+ // Positional grading (assumption: user types every character in order). >=90% unlocks the next Koch character.
+ grade(sent,typed){
+  const a=sent.replace(/\s/g,''),b=typed.toUpperCase().replace(/\s/g,'');let ok=0;
+  [...a].forEach((c,i)=>{const t=this.s.st[c]=this.s.st[c]||{a:0,m:0};t.a++;if(b[i]===c)ok++;else t.m++;});
+  const acc=ok/a.length,s=this.s;let un=null;
+  if(acc>=.9&&a.length>=20&&s.n<this.K.length){un=this.K[s.n];s.n++;}
+  const today=new Date().toISOString().slice(0,10),y=new Date(Date.now()-864e5).toISOString().slice(0,10);
+  if(s.last!==today){s.streak=s.last===y?s.streak+1:1;s.last=today;}
+  s.acc.push(Math.round(acc*100));if(s.acc.length>10)s.acc.shift();this.save();return{acc,un};}
+}
+
+/* ---------- UIManager: wires everything together ---------- */
+class UIManager{
+ constructor(){
+  this.pl=new MorsePlayer();this.kt=new KeyerTrainer(this);this.ln=new LessonEngine();this.log=[];
+  try{this.log=JSON.parse(localStorage.getItem('cwlog'))||[]}catch(e){}
+  this.rx=new MorseDecoder({cv:$('#rxcv'),player:this.pl,text:t=>{$('#rxout').value=t},stats:s=>this.stats('rx',s),note:n=>$('#rxnote').textContent=n});
+  this.ls=new MorseDecoder({cv:$('#lscv'),player:this.pl,text:t=>{$('#lsout').value=t;this.suggest(t)},stats:s=>this.stats('ls',s),note:n=>$('#lsnote').textContent=n});
+  this.tabs();this.tx();this.rxui();this.learn();this.hub();this.hist();this.kt.next();this.loop();
+ }
+ tabs(){
+  document.querySelectorAll('section').forEach(s=>{const b=document.createElement('button');b.textContent=s.dataset.t;b.onclick=()=>{document.querySelectorAll('section').forEach(x=>x.classList.toggle('on',x===s));[...$('#nav').children].forEach(x=>x.classList.toggle('on',x===b))};if(s.classList.contains('on'))b.classList.add('on');$('#nav').appendChild(b)});
+  $('#theme').onchange=e=>{document.body.dataset.theme=e.target.value};
+  $('#ao').onchange=e=>document.body.classList.toggle('audioonly',e.target.checked);
+  addEventListener('keydown',e=>{if(e.key.toLowerCase()==='w'&&!/INPUT|TEXTAREA/.test(e.target.tagName))document.body.classList.add('peek')});
+  addEventListener('keyup',e=>{if(e.key.toLowerCase()==='w')document.body.classList.remove('peek')});
+ }
+ safe(f){try{f()}catch(e){alert(e.message)}}
+ tx(){
+  const p=this.pl.p,upd=()=>{p.wpm=+$('#wpm').value;p.hz=+$('#hz').value;p.fw=Math.min(+$('#fw').value,p.wpm);p.type=$('#wave').value;$('#wpmv').textContent=p.wpm;$('#hzv').textContent=p.hz;$('#fwv').textContent=$('#fw').value};
+  ['wpm','hz','fw','wave'].forEach(i=>$('#'+i).oninput=upd);upd();
+  const go=()=>{const m=MorseEncoder.encode($('#txt').value);$('#morse').textContent=m||'(nothing to send)';return m};
+  $('#send').onclick=()=>{const m=go();if(m)this.safe(()=>this.pl.play(m))};
+  $('#play').onclick=()=>{if(this.pl.state==='paused')this.pl.pause();else $('#send').click()};
+  $('#pause').onclick=()=>this.pl.pause();$('#stop').onclick=()=>this.pl.stop();
+  $('#clr').onclick=()=>{this.pl.stop();$('#txt').value='';$('#morse').textContent='';};
+  $('#qso').onclick=()=>{$('#txt').value=this.qso();go()};
+  $('#wavb').onclick=async()=>{const m=go();if(!m)return;this.safe(async()=>{const b=await this.pl.render(m),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='cw.wav';a.click()})};
+  [['qrn','QRN static'],['qsb','QSB fading'],['qrm','QRM interference'],['flutter','Flutter'],['chirp','Chirp']].forEach(([k,l])=>{
+   const lb=document.createElement('label'),i=document.createElement('input');i.type='range';i.min=0;i.max=1;i.step=.05;i.value=0;i.oninput=()=>this.pl.noise.set(k,+i.value);lb.append(l,i);$('#nz').appendChild(lb)});
+  // straight key: Space bar (key mode) or pad via mouse/touch
+  const k=this.kt,pad=$('#pad');pad.onmousedown=()=>k.press();pad.onmouseup=pad.onmouseleave=()=>k.release();
+  pad.ontouchstart=e=>{e.preventDefault();k.press()};pad.ontouchend=e=>{e.preventDefault();k.release()};
+  addEventListener('keydown',e=>{if(e.code==='Space'&&$('#km').checked&&!/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)){e.preventDefault();if(!e.repeat)k.press()}});
+  addEventListener('keyup',e=>{if(e.code==='Space'&&$('#km').checked)k.release()});
+ }
+ keyShow(c,m){$('#kt').textContent=`${c}  (${m})`;}
+ keyFb(t){$('#kf').textContent=t;}
+ sidetone(on){ // dedicated sidetone oscillator gated with 5 ms ramps
+  try{const c=this.pl.ensure();if(!this.so){this.so=c.createOscillator();this.sg=c.createGain();this.sg.gain.value=0;this.so.connect(this.sg);this.sg.connect(c.destination);this.so.start();}
+   this.so.frequency.value=this.pl.p.hz;this.sg.gain.setTargetAtTime(on?.3:0,c.currentTime,.004);}catch(e){}}
+ // Dynamic QSO generator: random calls, names, RST, three operator styles
+ qso(){
+  const R=a=>a[Math.random()*a.length|0],L=()=>String.fromCharCode(65+Math.random()*26|0),call=()=>R(['W','K','N','VE','G','DL','JA','F','VU2'])+(Math.random()*10|0)+L()+L()+(Math.random()<.5?L():'');
+  const a=call(),b=call(),n=R(['JOHN','MARIA','RAJ','KEN','ANNA','TOM']),q=R(['OHIO','KERALA','TOKYO','LYON','TEXAS','BONN']),rst=R(['599','579','559','449']),s=R(['terse','chat','contest']);
+  if(s==='terse')return `CQ CQ DE ${a} ${a} K ${a} DE ${b} ${b} K ${b} DE ${a} UR RST ${rst} <BT> NAME ${n} QTH ${q} <AR> ${a} DE ${b} TU 73 <SK>`;
+  if(s==='contest')return `CQ TEST ${a} ${a} ${b} 5NN ${(Math.random()*99|0)+1} ${a} TU 5NN ${(Math.random()*99|0)+1} ${b} QRZ?`;
+  return `CQ CQ CQ DE ${a} ${a} ${a} PSE K ${a} DE ${b} GM OM TNX FER CALL UR RST ${rst} ${rst} NAME ${n} ${n} QTH ${q} ${q} HW? <KN> ${b} DE ${a} R FB ${n} TNX FER QSO 73 ES CUAGN <SK>`;
+ }
+ stats(p,s){$('#'+p+'w').textContent=s.wpm;$('#'+p+'h').textContent=s.hz;$('#'+p+'s').textContent=s.snr;$('#'+p+'l').textContent=s.lock;}
+ async toggle(d,btn,src,labels){
+  if(d.running){d.stop();btn.classList.remove('on');btn.textContent=labels[0];return true;}
+  if(await d.start(src)){btn.classList.add('on');btn.textContent=labels[1];d.view();}return false;}
+ rxui(){
+  const rx=this.rx,ls=this.ls;
+  $('#rxb').onclick=async()=>{const was=rx.running,t0=rx.t0,txt=$('#rxout').value,w=$('#rxw').textContent,h=$('#rxh').textContent;
+   await this.toggle(rx,$('#rxb'),$('#src').value,['Listen','Stop listening']);
+   if(was&&txt.trim()){this.log.unshift({ts:new Date(t0).toLocaleString(),dur:Math.round((Date.now()-t0)/1000),n:txt.length,wpm:w,hz:h,txt});this.log=this.log.slice(0,30);try{localStorage.setItem('cwlog',JSON.stringify(this.log))}catch(e){}this.hist();}};
+  $('#rxc').onclick=()=>rx.clear();
+  $('#algo').onchange=async e=>{await rx.setAlgo(e.target.value);if(e.target.value==='ml')$('#algo').value='otsu'};
+  $('#lm').onchange=e=>{rx.lm=e.target.checked;rx.view()};$('#afc').onchange=e=>{rx.afc=e.target.checked};
+  $('#mh').oninput=e=>{if(!rx.afc)rx.hz=clamp(+e.target.value||700,300,1500)};
+  $('#lsb').onclick=()=>this.toggle(ls,$('#lsb'),$('#src2').value,['Start listening','Stop listening']);
+  $('#sens').oninput=e=>{ls.sens=+e.target.value};ls.lm=true;
+ }
+ hist(){$('#hist').innerHTML=this.log.length?'':'No sessions yet.';this.log.forEach(l=>{const d=document.createElement('div');d.textContent=`${l.ts} | ${l.dur}s | ${l.n} chars | ${l.wpm} WPM | ${l.hz} Hz | ${l.txt}`;$('#hist').appendChild(d)});}
+ suggest(t){
+  const me=($('#mycall').value||'N0CALL').toUpperCase(),u=' '+t.toUpperCase().trim().split(/\s+/).slice(-14).join(' ')+' ',
+   at=k=>u.lastIndexOf(' '+k+' '),m=u.match(/DE ([A-Z0-9\/]{3,})/g),their=m?m[m.length-1].slice(3):'';
+  const c=[[at('73'),'73 SK'],[at('RST'),`UR RST 599 ${me} BK`],[at('QRZ'),`${me} ${me}`],[at('CQ'),`${their?their+' ':''}DE ${me} ${me} K`]].sort((a,b)=>b[0]-a[0])[0];
+  $('#sugg').textContent=c[0]>=0?c[1]:'Listening…';
+ }
+ learn(){
+  const L=this.ln,dash=()=>{const s=L.s;$('#dash').innerHTML=`<p>Unlocked <b>${s.n}</b>/${L.K.length}: <b>${L.pool().join(' ')}</b> | next: ${L.K[s.n]||'done'} | streak <b>${s.streak}</b> day(s) | recent accuracy: ${s.acc.join('% ,')||'–'}%</p>`+L.pool().map(c=>`<span style="margin-right:8px">${c}:${s.st[c]&&s.st[c].a?Math.round(100-100*L.miss(c)):'–'}%</span>`).join('')};
+  dash();let cur='';
+  const run=t=>{cur=t.toUpperCase();$('#lr').textContent='Listening… type what you heard, then Check.';$('#ans').value='';this.safe(()=>this.pl.play(MorseEncoder.encode(cur)))};
+  $('#l1').onclick=()=>run(L.drill(false));$('#l2').onclick=()=>run(L.drill(true));
+  $('#l3').onclick=()=>{const t=$('#cust').value.toUpperCase().replace(/[^A-Z0-9 .,?\/=+\-]/g,' ').replace(/\s+/g,' ').trim().slice(0,160);if(t)run(t)};
+  $('#chk').onclick=()=>{if(!cur)return;const r=L.grade(cur,$('#ans').value);$('#lr').innerHTML=`Accuracy <b>${Math.round(r.acc*100)}%</b>. Sent: ${cur}${r.un?` <b>Unlocked "${r.un}"!</b>`:r.acc<.9?' (need 90% to unlock the next character)':''}`;cur='';dash();};
+ }
+ hub(){
+  $('#hub').oninput=e=>{const v=e.target.value,isM=/^[.\-\/\s]+$/.test(v)&&/[.\-]/.test(v),o=isM?MorseEncoder.decode(v):MorseEncoder.encode(v);
+   $('#hubo').textContent=o;$('#hubc').textContent=`${isM?'Morse → text':'Text → Morse'} | input ${v.length} chars | output ${o.length} chars | ${(o.match(/[.\-]/g)||[]).length} symbols`};
+ }
+ scope(){ // neon oscilloscope: fading trail + glow
+  const c=$('#scope'),x=c.getContext('2d'),a=this.pl.an,d=this.sd||(this.sd=new Float32Array(a.fftSize));a.getFloatTimeDomainData(d);
+  x.fillStyle='rgba(0,0,0,.35)';x.fillRect(0,0,c.width,c.height);x.strokeStyle=getComputedStyle(document.body).getPropertyValue('--ac');x.shadowColor=x.strokeStyle;x.shadowBlur=12;x.lineWidth=2;x.beginPath();
+  for(let i=0;i<c.width;i++){const y=c.height/2-d[i*3]*c.height*.45;i?x.lineTo(i,y):x.moveTo(i,y)}x.stroke();x.shadowBlur=0;}
+ loop(){const p=this.pl;if(p.ctx){p.sync();$('#dot').classList.toggle('lit',p.lit);this.scope();}requestAnimationFrame(()=>this.loop());}
+}
+window.addEventListener('DOMContentLoaded',()=>{try{new UIManager()}catch(e){document.body.insertAdjacentHTML('afterbegin','<p>Unsupported browser: '+e.message+'</p>')}});
+</script></body></html>
